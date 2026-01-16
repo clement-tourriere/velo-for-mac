@@ -112,8 +112,8 @@ EOF
 
 "$COLIMA_BIN" ssh --profile "$PROFILE" -- velo setup
 
-# Fix ownership issues created by velo setup
-"$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -c 'sudo chown -R $(id -un):$(id -gn) $HOME/.velo'
+# Fix ownership issues created by velo setup (directory may not exist yet)
+"$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -c 'sudo chown -R $(id -un):$(id -gn) $HOME/.velo 2>/dev/null; true'
 "$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -c 'sudo chown root:root /etc/sudoers.d/velo 2>/dev/null; sudo chmod 440 /etc/sudoers.d/velo 2>/dev/null; true'
 
 # Restart to apply velo group membership
