@@ -44,7 +44,7 @@ velo doctor
 - Connect from macOS using the shown `localhost:<port>`.
 
 ## Docker note (inside VM)
-The setup script installs Docker via Ubuntu packages (`docker.io`). If you already ran the official Docker install script and got a “held packages” error, this is expected on Ubuntu 24.04 inside Colima.
+The setup script installs Docker via Ubuntu packages (`docker.io`). If you already ran the official Docker install script and got a "held packages" error, this is expected on Ubuntu 24.04 inside Colima.
 
 ## Customization
 All settings can be overridden by environment variables when running `colima-velo-setup.sh`:
@@ -58,6 +58,8 @@ All settings can be overridden by environment variables when running `colima-vel
 - `VELO_POOL_SIZE` (default: `30G`)
 - `VELO_VM_TYPE` (default: `qemu` - required for ZFS kernel modules)
 - `VELO_COLIMA_BIN` (default: `colima`)
+- `VELO_VERSION` (default: `latest` - Velo version to install, e.g. `v1.0.0`)
+- `VELO_SKIP_CLEANUP` (default: `false` - skip cleanup of stale containers/data)
 
 Example:
 ```bash
@@ -99,14 +101,30 @@ Or specify a version:
 
 ## Uninstall
 
-To completely remove Velo:
+To completely remove Velo and all its data:
 
 ```bash
-# Remove the Colima VM (includes all data, ZFS pool, and velo inside)
-colima delete --profile velo
+# Delete the Colima VM (this removes EVERYTHING inside the VM)
+colima delete --profile velo --force
+```
 
+This permanently deletes:
+- All Velo projects and branches
+- All database snapshots (ZFS pool)
+- The Velo binary and source code
+- Docker containers and images inside the VM
+- The entire VM disk (~40GB by default)
+
+```bash
 # Remove the macOS wrapper script
 sudo rm -f /usr/local/bin/velo
 ```
 
+**Optional:** Remove Colima configuration for the velo profile:
+```bash
+rm -rf ~/.colima/velo
+```
+
 That's it - no other files are created on macOS.
+
+> **Note:** If you used a custom profile name via `VELO_PROFILE`, replace `velo` with your profile name in the commands above.

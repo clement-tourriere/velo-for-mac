@@ -10,6 +10,8 @@ POOL_NAME="${VELO_POOL_NAME:-velopool}"
 POOL_IMG="${VELO_POOL_IMG:-/var/lib/velo/zpool.img}"
 POOL_SIZE="${VELO_POOL_SIZE:-30G}"
 COLIMA_BIN="${VELO_COLIMA_BIN:-colima}"
+VELO_VERSION="${VELO_VERSION:-latest}"
+SKIP_CLEANUP="${VELO_SKIP_CLEANUP:-false}"
 
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "arm64" ]]; then
@@ -26,6 +28,17 @@ if ! command -v "$COLIMA_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Clean up stale velo containers from previous installations (e.g., in OrbStack/Docker Desktop)
+# These can conflict with new containers created inside the Colima VM
+if [ "$SKIP_CLEANUP" != "true" ]; then
+  STALE_CONTAINERS=$(docker ps -a --filter "name=velo-" --format '{{.Names}}' 2>/dev/null || true)
+  if [ -n "$STALE_CONTAINERS" ]; then
+    echo "==> Cleaning up stale velo containers..."
+    echo "$STALE_CONTAINERS" | xargs -r docker rm -f 2>/dev/null || true
+  fi
+fi
+
+echo "==> Starting Colima VM (profile: $PROFILE)..."
 "$COLIMA_BIN" start --profile "$PROFILE" \
   --runtime docker \
   --cpu "$CPU" \
@@ -34,42 +47,71 @@ fi
   --arch "$COLIMA_ARCH" \
   --vm-type "$VM_TYPE"
 
-"$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -s -- "$POOL_NAME" "$POOL_IMG" "$POOL_SIZE" <<'EOF'
+echo "==> Configuring VM and installing dependencies..."
+
+# Clean up stale velo data from previous installations inside the VM
+if [ "$SKIP_CLEANUP" != "true" ]; then
+  "$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -c '
+    # Clean up stale velo containers inside the VM
+    STALE=$(docker ps -a --filter "name=velo-" --format "{{.Names}}" 2>/dev/null || true)
+    if [ -n "$STALE" ]; then
+      echo "    Cleaning up stale velo containers..."
+      echo "$STALE" | xargs -r docker rm -f 2>/dev/null || true
+    fi
+    # Clean up stale velo data directory
+    if [ -d "$HOME/.velo" ]; then
+      echo "    Cleaning up stale velo data..."
+      sudo rm -rf "$HOME/.velo" 2>/dev/null || true
+    fi
+  ' 2>/dev/null || true
+fi
+
+"$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -s -- "$POOL_NAME" "$POOL_IMG" "$POOL_SIZE" "$VELO_VERSION" <<'EOF'
 set -euo pipefail
 POOL_NAME="$1"
 POOL_IMG="$2"
 POOL_SIZE="$3"
+VELO_VERSION="$4"
 
+# Ubuntu 24.04+ has ZFS modules pre-built in the kernel - no DKMS needed!
+# Bun compiles velo to a standalone binary - no Node.js needed at runtime!
+
+# Kill any stale apt processes from previous interrupted runs
+if pgrep -x apt >/dev/null 2>&1; then
+  echo "    Killing stale apt process..."
+  sudo pkill -9 apt 2>/dev/null || true
+  sleep 1
+fi
+sudo rm -f /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend 2>/dev/null || true
+
+echo "    Updating package lists..."
 sudo apt update
 
-HEADER_PKG="linux-headers-$(uname -r)"
-if ! apt-cache show "$HEADER_PKG" >/dev/null 2>&1; then
-  echo "Kernel headers for $(uname -r) not available."
-  echo "ZFS DKMS needs matching headers. Recreate the Colima profile with VELO_VM_TYPE=qemu." >&2
-  exit 1
-fi
+# Minimal package list - only what's strictly needed
+PACKAGES=(
+  zfsutils-linux
+  curl
+  ca-certificates
+  git
+  unzip
+)
 
-sudo apt install -y zfsutils-linux zfs-dkms "$HEADER_PKG" curl ca-certificates gnupg zstd git unzip
-
-NODE_MAJOR=0
-if command -v node >/dev/null 2>&1; then
-  NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-fi
-if [ "$NODE_MAJOR" -lt 20 ]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-  sudo apt install -y nodejs
-fi
-
+# Add docker if not present
 if ! command -v docker >/dev/null 2>&1; then
-  sudo apt install -y --allow-change-held-packages docker.io docker-compose-plugin
+  PACKAGES+=(docker.io docker-compose-plugin)
 fi
 
+echo "    Installing packages..."
+sudo DEBIAN_FRONTEND=noninteractive apt install -y --allow-change-held-packages "${PACKAGES[@]}"
+
+echo "    Loading ZFS kernel module..."
 if ! sudo modprobe zfs; then
   echo "Failed to load zfs kernel module. This often happens with Colima --vm-type=vz on Apple Silicon." >&2
   echo "Delete the profile and rerun with VELO_VM_TYPE=qemu." >&2
   exit 1
 fi
 
+echo "    Setting up ZFS pool..."
 sudo mkdir -p "$(dirname "$POOL_IMG")"
 
 if ! sudo zpool list "$POOL_NAME" >/dev/null 2>&1; then
@@ -82,42 +124,67 @@ if ! sudo zpool list "$POOL_NAME" >/dev/null 2>&1; then
 fi
 
 if [ -x /usr/local/bin/velo ]; then
-  echo "Velo already installed in VM."
+  echo "    Velo already installed in VM."
 else
-  curl -fsSL https://bun.sh/install | bash
+  echo "    Installing Bun and cloning Velo (in parallel)..."
+  
+  # Start bun install in background
+  (curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1) &
+  BUN_PID=$!
+  
+  # Clone velo repo in parallel
+  if [ ! -d "$HOME/.velo-src" ]; then
+    git clone --quiet https://github.com/elitan/velo.git "$HOME/.velo-src"
+  fi
+  
+  # Wait for bun installation to complete
+  wait $BUN_PID
+  
   BUN_BIN="$HOME/.bun/bin/bun"
   if [ ! -x "$BUN_BIN" ]; then
     echo "Failed to install bun." >&2
     exit 1
   fi
 
-  if [ ! -d "$HOME/.velo-src" ]; then
-    git clone https://github.com/elitan/velo.git "$HOME/.velo-src"
-  fi
-
   cd "$HOME/.velo-src"
-  git fetch --tags
-  git checkout "v1.0.0"
-  "$BUN_BIN" install
+  git fetch --tags --quiet
+  
+  # Resolve version
+  if [ "$VELO_VERSION" = "latest" ]; then
+    VELO_VERSION=$(git describe --tags --abbrev=0 origin/main 2>/dev/null || echo "v1.0.0")
+  fi
+  
+  echo "    Building Velo $VELO_VERSION..."
+  git checkout "$VELO_VERSION" --quiet
+  "$BUN_BIN" install --silent
   "$BUN_BIN" build --compile --minify --sourcemap src/index.ts --outfile dist/velo
 
   sudo install -m 0755 dist/velo /usr/local/bin/velo
 fi
 
+# Add user to docker group (will take effect after restart)
 sudo usermod -aG docker "$(id -un)"
 EOF
 
+echo "==> Restarting VM to apply group membership..."
 "$COLIMA_BIN" stop --profile "$PROFILE"
 "$COLIMA_BIN" start --profile "$PROFILE"
 
+echo "==> Running velo setup..."
 "$COLIMA_BIN" ssh --profile "$PROFILE" -- velo setup
 
-# Fix ownership issues created by velo setup (directory may not exist yet)
-"$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -c 'sudo chown -R $(id -un):$(id -gn) $HOME/.velo 2>/dev/null; true'
-"$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -c 'sudo chown root:root /etc/sudoers.d/velo 2>/dev/null; sudo chmod 440 /etc/sudoers.d/velo 2>/dev/null; true'
+# Fix ownership issues created by velo setup
+"$COLIMA_BIN" ssh --profile "$PROFILE" -- bash -c '
+sudo chown -R $(id -un):$(id -gn) $HOME/.velo 2>/dev/null || true
+sudo chown root:root /etc/sudoers.d/velo 2>/dev/null || true
+sudo chmod 440 /etc/sudoers.d/velo 2>/dev/null || true
+'
 
-# Restart to apply velo group membership
+# Restart to apply velo group membership from velo setup
+echo "==> Restarting VM to apply velo group membership..."
 "$COLIMA_BIN" stop --profile "$PROFILE"
 "$COLIMA_BIN" start --profile "$PROFILE"
 
-echo "Velo setup complete. Install wrapper with: sudo install -m 0755 velo-wrapper.sh /usr/local/bin/velo"
+echo ""
+echo "==> Velo setup complete!"
+echo "    Install wrapper with: sudo install -m 0755 velo-wrapper.sh /usr/local/bin/velo"
